@@ -1,0 +1,523 @@
+name: scp-alerts
+on:
+  schedule:
+    - cron: '3-59/15 * * * 1-5'
+    - cron: '3-59/15 21-23 * * 0'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'run | dry | test'
+        default: 'run'
+concurrency:
+  group: scp
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run
+        env:
+          TWELVE_API_KEY: ${{ secrets.TWELVE_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISPLAY_TZ: ${{ vars.DISPLAY_TZ }}
+          AI_FILTER: ${{ vars.AI_FILTER }}
+        run: |
+          case "${{ github.event.inputs.mode }}" in
+            dry)  ARG="--dry" ;;
+            test) ARG="--test" ;;
+            *)    ARG="" ;;
+          esac
+          python - $ARG <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
+          from bisect import bisect_left
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+
+          PAIRS = ["USD/CAD", "GBP/USD", "EUR/USD", "USD/JPY"]
+          BASE = 900
+          HTF = 3600
+          OUTPUTSIZE = 1500
+          STATE_FILE = "state.json"
+
+          C = dict(
+              model=os.getenv("SCP_MODEL") or "3",
+              emaF=9, emaS=21, minSep=0.25, adxLen=14, adxMin=25.0,
+              rsiLen=14, rsiHi=65.0, rsiLo=35.0, bodyMin=0.25, closeStr=0.75,
+              swL=4, sweepBars=4, srTol=0.4, room=1.0, impMult=1.5, zoneAge=100,
+              minConf=2, atrLen=14, atrLo=0.8, atrHi=2.0, cooldown=9,
+          )
+          MAX_AGE_MIN = 9.0
+          AI_FILTER = os.getenv("AI_FILTER") == "1"
+
+
+          def sma(x, n):
+              out = [None] * len(x)
+              for i in range(n - 1, len(x)):
+                  w = x[i - n + 1:i + 1]
+                  if None not in w:
+                      out[i] = sum(w) / n
+              return out
+
+
+          def rma(x, n):
+              out = [None] * len(x)
+              prev = None
+              buf = []
+              for i, v in enumerate(x):
+                  if v is None:
+                      continue
+                  if prev is None:
+                      buf.append(v)
+                      if len(buf) == n:
+                          prev = sum(buf) / n
+                          out[i] = prev
+                  else:
+                      prev = (prev * (n - 1) + v) / n
+                      out[i] = prev
+              return out
+
+
+          def ema(x, n):
+              a = 2.0 / (n + 1)
+              out = [None] * len(x)
+              prev = None
+              buf = []
+              for i, v in enumerate(x):
+                  if v is None:
+                      continue
+                  if prev is None:
+                      buf.append(v)
+                      if len(buf) == n:
+                          prev = sum(buf) / n
+                          out[i] = prev
+                  else:
+                      prev = a * v + (1 - a) * prev
+                      out[i] = prev
+              return out
+
+
+          def rsi_calc(c, n):
+              up = [None] + [max(c[i] - c[i - 1], 0.0) for i in range(1, len(c))]
+              dn = [None] + [max(c[i - 1] - c[i], 0.0) for i in range(1, len(c))]
+              u, d = rma(up, n), rma(dn, n)
+              out = [None] * len(c)
+              for i in range(len(c)):
+                  if u[i] is None or d[i] is None:
+                      continue
+                  if d[i] == 0:
+                      out[i] = 100.0
+                  elif u[i] == 0:
+                      out[i] = 0.0
+                  else:
+                      out[i] = 100.0 - 100.0 / (1.0 + u[i] / d[i])
+              return out
+
+
+          def dmi_calc(h, l, tr, n):
+              m = len(h)
+              pdm = [None] * m
+              mdm = [None] * m
+              for i in range(1, m):
+                  up = h[i] - h[i - 1]
+                  dn = l[i - 1] - l[i]
+                  pdm[i] = up if (up > dn and up > 0) else 0.0
+                  mdm[i] = dn if (dn > up and dn > 0) else 0.0
+              t, p, q = rma(tr, n), rma(pdm, n), rma(mdm, n)
+              dip = [None] * m
+              dim = [None] * m
+              dx = [None] * m
+              for i in range(m):
+                  if t[i] and p[i] is not None and q[i] is not None:
+                      dip[i] = 100.0 * p[i] / t[i]
+                      dim[i] = 100.0 * q[i] / t[i]
+                      s = dip[i] + dim[i]
+                      dx[i] = abs(dip[i] - dim[i]) / (s if s else 1.0)
+              adx = [None if v is None else 100.0 * v for v in rma(dx, n)]
+              return dip, dim, adx
+
+
+          def pivot_high(h, i, L):
+              c = i - L
+              if c - L < 0:
+                  return None
+              v = h[c]
+              for k in range(1, L + 1):
+                  if h[c - k] > v or h[c + k] >= v:
+                      return None
+              return v
+
+
+          def pivot_low(l, i, L):
+              c = i - L
+              if c - L < 0:
+                  return None
+              v = l[c]
+              for k in range(1, L + 1):
+                  if l[c - k] < v or l[c + k] <= v:
+                      return None
+              return v
+
+
+          def fetch5(pair, key):
+              q = urllib.parse.urlencode({
+                  "symbol": pair, "interval": "5min", "outputsize": OUTPUTSIZE,
+                  "timezone": "UTC", "order": "asc", "apikey": key,
+              })
+              req = urllib.request.Request("https://api.twelvedata.com/time_series?" + q,
+                                           headers={"User-Agent": "scp-alerts"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  d = json.load(r)
+              if d.get("status") == "error" or "values" not in d:
+                  raise RuntimeError("API error: %s" % d.get("message", "unknown"))
+              out = []
+              for v in d["values"]:
+                  t = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                  out.append(dict(t=int(t.timestamp()), o=float(v["open"]), h=float(v["high"]),
+                                  l=float(v["low"]), c=float(v["close"])))
+              out.sort(key=lambda b: b["t"])
+              return out
+
+
+          def aggregate(bars5, step, now):
+              need = step // 300
+              groups = {}
+              for b in bars5:
+                  if b["t"] + 300 > now:
+                      continue
+                  groups.setdefault(b["t"] // step * step, []).append(b)
+              out = []
+              for k in sorted(groups):
+                  g = sorted(groups[k], key=lambda b: b["t"])
+                  if len(g) != need or len({b["t"] for b in g}) != need:
+                      continue
+                  out.append(dict(t=k, o=g[0]["o"], h=max(b["h"] for b in g),
+                                  l=min(b["l"] for b in g), c=g[-1]["c"]))
+              return out
+
+
+          def run_scp(b, b30):
+              n = len(b)
+              o = [x["o"] for x in b]
+              h = [x["h"] for x in b]
+              l = [x["l"] for x in b]
+              c = [x["c"] for x in b]
+              tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+                                     for i in range(1, n)]
+              atr = rma(tr, C["atrLen"])
+              atrAvg = sma(atr, 50)
+              ef, es = ema(c, C["emaF"]), ema(c, C["emaS"])
+              diP, diM, adx = dmi_calc(h, l, tr, C["adxLen"])
+              rsi = rsi_calc(c, C["rsiLen"])
+
+              c30 = [x["c"] for x in b30]
+              t30 = [x["t"] for x in b30]
+              e30f, e30s = ema(c30, C["emaF"]), ema(c30, C["emaS"])
+
+              def htf(t):
+                  j = bisect_left(t30, t // HTF * HTF) - 1
+                  if j < 0 or e30f[j] is None or e30s[j] is None:
+                      return None
+                  return e30f[j], e30s[j], c30[j]
+
+              lastPH = prevPH = lastPL = prevPL = None
+              swB = swS = None
+              dTop = dBot = dBar = sTop = sBot = sBar = None
+              lastSig = -1000
+              sigs = []
+              L = C["swL"]
+
+              for i in range(n):
+                  ph, pl = pivot_high(h, i, L), pivot_low(l, i, L)
+                  if ph is not None:
+                      prevPH, lastPH = lastPH, ph
+                  if pl is not None:
+                      prevPL, lastPL = lastPL, pl
+                  st = None not in (lastPH, prevPH, lastPL, prevPL)
+                  bullS = st and lastPH > prevPH and lastPL > prevPL
+                  bearS = st and lastPH < prevPH and lastPL < prevPL
+
+                  if lastPL is not None and l[i] < lastPL and c[i] > lastPL:
+                      swB = i
+                  if lastPH is not None and h[i] > lastPH and c[i] < lastPH:
+                      swS = i
+                  sweepBull = swB is not None and i - swB <= C["sweepBars"]
+                  sweepBear = swS is not None and i - swS <= C["sweepBars"]
+
+                  a = atr[i]
+                  if a is not None and i > 0:
+                      if c[i] - o[i] > a * C["impMult"] and c[i - 1] < o[i - 1]:
+                          dTop, dBot, dBar = h[i - 1], l[i - 1], i
+                      if o[i] - c[i] > a * C["impMult"] and c[i - 1] > o[i - 1]:
+                          sTop, sBot, sBar = h[i - 1], l[i - 1], i
+                  if dBot is not None and (c[i] < dBot or i - dBar > C["zoneAge"]):
+                      dTop = dBot = None
+                  if sTop is not None and (c[i] > sTop or i - sBar > C["zoneAge"]):
+                      sTop = sBot = None
+                  inDemand = dTop is not None and i > dBar and l[i] <= dTop and c[i] > dBot
+                  inSupply = sTop is not None and i > sBar and h[i] >= sBot and c[i] < sTop
+
+                  need = (a, atrAvg[i], ef[i], es[i], diP[i], diM[i], adx[i], rsi[i])
+                  if i < 3 or None in need or rsi[i - 1] is None:
+                      continue
+                  H = htf(b[i]["t"])
+                  low3 = min(l[i - 2:i + 1])
+                  high3 = max(h[i - 2:i + 1])
+
+                  nearSup = lastPL is not None and abs(l[i] - lastPL) <= a * C["srTol"]
+                  nearRes = lastPH is not None and abs(h[i] - lastPH) <= a * C["srTol"]
+                  roomBuy = lastPH is None or lastPH < c[i] or lastPH - c[i] > a * C["room"]
+                  roomSell = lastPL is None or lastPL > c[i] or c[i] - lastPL > a * C["room"]
+
+                  trendUp = H is not None and H[0] > H[1] and H[2] > H[1] and ef[i] > es[i] and c[i] > es[i]
+                  trendDn = H is not None and H[0] < H[1] and H[2] < H[1] and ef[i] < es[i] and c[i] < es[i]
+                  trending = adx[i] >= C["adxMin"] and abs(ef[i] - es[i]) > a * C["minSep"]
+                  momUp = diP[i] > diM[i] and 50 < rsi[i] < C["rsiHi"] and rsi[i] > rsi[i - 1]
+                  momDn = diM[i] > diP[i] and C["rsiLo"] < rsi[i] < 50 and rsi[i] < rsi[i - 1]
+                  rng = h[i] - l[i]
+                  closePos = (c[i] - l[i]) / rng if rng > 0 else 0.5
+                  candleUp = c[i] > o[i] and closePos >= C["closeStr"] and (c[i] - o[i]) > a * C["bodyMin"]
+                  candleDn = c[i] < o[i] and closePos <= 1 - C["closeStr"] and (o[i] - c[i]) > a * C["bodyMin"]
+                  lowWick = min(o[i], c[i]) - l[i]
+                  upWick = h[i] - max(o[i], c[i])
+                  rejUp = c[i] > o[i] and rng > 0 and lowWick > rng * 0.4
+                  rejDn = c[i] < o[i] and rng > 0 and upWick > rng * 0.4
+                  ratio = a / atrAvg[i] if atrAvg[i] > 0 else 0
+                  volOK = atrAvg[i] > 0 and C["atrLo"] <= ratio <= C["atrHi"]
+
+                  confBuy = int(sweepBull) + int(inDemand or nearSup)
+                  confSell = int(sweepBear) + int(inSupply or nearRes)
+
+                  m = C["model"]
+                  if m == "1":
+                      buyM = (trendUp and trending and bullS and low3 <= ef[i] and c[i] > ef[i] and candleUp
+                              and 50 < rsi[i] < C["rsiHi"] and diP[i] > diM[i])
+                      sellM = (trendDn and trending and bearS and high3 >= ef[i] and c[i] < ef[i] and candleDn
+                               and C["rsiLo"] < rsi[i] < 50 and diM[i] > diP[i])
+                  elif m == "2":
+                      buyM = sweepBull and rejUp and not trendDn and (inDemand or nearSup) and rsi[i] < 60 and roomBuy
+                      sellM = sweepBear and rejDn and not trendUp and (inSupply or nearRes) and rsi[i] > 40 and roomSell
+                  else:
+                      buyM = (trendUp and trending and bullS and momUp and candleUp
+                              and confBuy >= C["minConf"] and roomBuy and not sweepBear)
+                      sellM = (trendDn and trending and bearS and momDn and candleDn
+                               and confSell >= C["minConf"] and roomSell and not sweepBull)
+
+                  cool = i - lastSig >= C["cooldown"]
+                  buy = buyM and volOK and cool
+                  sell = sellM and volOK and cool
+                  if buy and sell:
+                      continue
+                  if not (buy or sell):
+                      continue
+                  lastSig = i
+                  info = dict(adx=adx[i], rsi=rsi[i], ratio=ratio,
+                              trend="UP" if trendUp else ("DOWN" if trendDn else "MIXED"))
+
+                  if buy:
+                      parts = ["اتجاه 60د صاعد" if m != "2" else "Sweep لقاع + شمعة رفض",
+                               "ADX %.0f" % adx[i], "RSI %.0f" % rsi[i]]
+                      if sweepBull:
+                          parts.append("سحب سيولة تحت قاع")
+                      if inDemand:
+                          parts.append("ارتداد من منطقة طلب")
+                      elif nearSup:
+                          parts.append("قرب دعم")
+                      sigs.append((i, "BUY", " | ".join(parts), info))
+                  else:
+                      parts = ["اتجاه 60د هابط" if m != "2" else "Sweep لقمة + شمعة رفض",
+                               "ADX %.0f" % adx[i], "RSI %.0f" % rsi[i]]
+                      if sweepBear:
+                          parts.append("سحب سيولة فوق قمة")
+                      if inSupply:
+                          parts.append("ارتداد من منطقة عرض")
+                      elif nearRes:
+                          parts.append("قرب مقاومة")
+                      sigs.append((i, "SELL", " | ".join(parts), info))
+              return sigs
+
+
+          def analyze(bars5, now):
+              b10 = aggregate(bars5, BASE, now)
+              b30 = aggregate(bars5, HTF, now)
+              if len(b10) < 120 or len(b30) < 40:
+                  raise RuntimeError("not enough data (15M=%d, 60M=%d)" % (len(b10), len(b30)))
+              return b10, run_scp(b10, b30)
+
+
+          def fmt_price(pair, p):
+              return ("%.3f" if "JPY" in pair else "%.5f") % p
+
+
+          def ask_ai(pair, side, b, i, info):
+              key = os.getenv("GEMINI_API_KEY")
+              if not key:
+                  return None
+              rows = []
+              for x in b[max(0, i - 29):i + 1]:
+                  rows.append("%s,%s,%s,%s" % (fmt_price(pair, x["o"]), fmt_price(pair, x["h"]),
+                                               fmt_price(pair, x["l"]), fmt_price(pair, x["c"])))
+              prompt = (
+                  "You are a cautious forex technical analyst. A rule-based system fired a " + side +
+                  " signal on " + pair + " after a CLOSED 15-minute candle. The trade lasts 30 minutes (2 candles). "
+                  "Do not claim certainty. Judge only whether the recent price action supports this signal. "
+                  "Indicators: ADX %.0f, RSI %.0f, 60-minute trend %s, volatility ratio %.2f. "
+                  "Last 30 candles of 15 minutes, oldest first, as open,high,low,close:\n" % (
+                      info["adx"], info["rsi"], info["trend"], info["ratio"])
+                  + "\n".join(rows)
+                  + '\nReply with JSON only: {"verdict":"AGREE" or "DISAGREE" or "UNSURE","reason":"max 15 words in Arabic"}'
+              )
+              models = [os.getenv("GEMINI_MODEL") or "gemini-3.5-flash", "gemini-2.5-flash"]
+              body = json.dumps({
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+              }).encode("utf-8")
+              for mdl in models:
+                  try:
+                      req = urllib.request.Request(
+                          "https://generativelanguage.googleapis.com/v1beta/models/" + mdl + ":generateContent",
+                          data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
+                      with urllib.request.urlopen(req, timeout=40) as r:
+                          d = json.load(r)
+                      txt = d["candidates"][0]["content"]["parts"][0]["text"]
+                      j = json.loads(txt)
+                      v = str(j.get("verdict", "UNSURE")).upper()
+                      if v not in ("AGREE", "DISAGREE", "UNSURE"):
+                          v = "UNSURE"
+                      return v, str(j.get("reason", ""))[:120]
+                  except Exception as e:
+                      print("AI error (%s): %s" % (mdl, type(e).__name__))
+              return None
+
+
+          def load_state():
+              try:
+                  with open(STATE_FILE, encoding="utf-8") as f:
+                      return json.load(f)
+              except (OSError, ValueError):
+                  return {}
+
+
+          def save_state(st):
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(st, f, indent=1, sort_keys=True)
+
+
+          def ntfy(topic, title, message, priority=4, tags=None):
+              server = os.getenv("NTFY_SERVER") or "https://ntfy.sh"
+              body = json.dumps({"topic": topic, "title": title, "message": message,
+                                 "priority": priority, "tags": tags or []}).encode("utf-8")
+              req = urllib.request.Request(server, data=body, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  r.read()
+
+
+          AI_TXT = {"AGREE": "يوافق", "DISAGREE": "يخالف", "UNSURE": "غير متأكد"}
+
+
+          def main():
+              args = sys.argv[1:]
+              topic = os.getenv("NTFY_TOPIC")
+              key = os.getenv("TWELVE_API_KEY")
+              tz = ZoneInfo(os.getenv("DISPLAY_TZ") or "UTC")
+
+              if "--test" in args:
+                  ntfy(topic, "SCP test", "الإشعارات تعمل. هذه رسالة اختبار فقط.", 3, ["white_check_mark"])
+                  print("test sent")
+                  return
+
+              dry = "--dry" in args
+              now = int(time.time())
+              state = load_state()
+              ok = 0
+              for pair in PAIRS:
+                  try:
+                      bars5 = fetch5(pair, key)
+                      b10, sigs = analyze(bars5, now)
+                      ok += 1
+                  except Exception as e:
+                      print("%s: ERROR %s" % (pair, e))
+                      time.sleep(1)
+                      continue
+                  last_i = len(b10) - 1
+                  close_t = b10[-1]["t"] + BASE
+                  if dry:
+                      for i, side, why, _info in sigs[-8:]:
+                          t = datetime.fromtimestamp(b10[i]["t"] + BASE, tz).strftime("%d/%m %H:%M")
+                          print("%s %s %s @ %s  %s" % (pair, side, t, fmt_price(pair, b10[i]["c"]), why))
+                      print("%s: %d signals in window" % (pair, len(sigs)))
+                      time.sleep(1)
+                      continue
+                  age = now - close_t
+                  if age > 3600:
+                      print("%s: market closed / no fresh data" % pair)
+                  else:
+                      hit = [s for s in sigs if s[0] == last_i]
+                      if not hit:
+                          print("%s: no signal" % pair)
+                      else:
+                          _, side, why, info = hit[0]
+                          iso = datetime.fromtimestamp(close_t, timezone.utc).isoformat()
+                          if state.get(pair) == iso:
+                              print("%s: already sent" % pair)
+                          elif age > MAX_AGE_MIN * 60:
+                              print("%s: %s signal is stale (%d min old) - skipped" % (pair, side, age // 60))
+                          else:
+                              ai = ask_ai(pair, side, b10, last_i, info)
+                              if ai and ai[0] == "DISAGREE" and AI_FILTER:
+                                  state[pair] = iso
+                                  print("%s: %s signal blocked by AI" % (pair, side))
+                              else:
+                                  when = datetime.fromtimestamp(close_t, tz).strftime("%H:%M (%d/%m)")
+                                  icon = "🟢" if side == "BUY" else "🔴"
+                                  ai_line = ""
+                                  if ai:
+                                      ai_line = "رأي AI: %s - %s\n" % (AI_TXT[ai[0]], ai[1])
+                                  msg = (
+                                      "%s %s — %s\n"
+                                      "وقت الإشارة: %s\n"
+                                      "سعر الدخول التقريبي: %s\n"
+                                      "الفريم: 15 دقيقة | التأكيد: 60 دقيقة\n"
+                                      "مدة الصفقة: 30 دقيقة\n"
+                                      "السبب: %s\n"
+                                      "%s"
+                                      "عمر الإشارة: %d د\n"
+                                      "ادخل يدوياً عند افتتاح الشمعة التالية. الإشارة غير مضمونة."
+                                      % (icon, side, pair, when, fmt_price(pair, b10[-1]["c"]), why, ai_line, age // 60)
+                                  )
+                                  ntfy(topic, "%s %s" % (side, pair), msg, 4,
+                                       ["green_circle" if side == "BUY" else "red_circle"])
+                                  state[pair] = iso
+                                  print("%s: %s sent" % (pair, side))
+                  time.sleep(1)
+
+              if not dry:
+                  save_state(state)
+              if ok == 0:
+                  sys.exit(1)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "scp-bot"
+            git config user.email "scp-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "state"
+            git push
+          fi
